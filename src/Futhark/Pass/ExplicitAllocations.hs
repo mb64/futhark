@@ -41,6 +41,7 @@ module Futhark.Pass.ExplicitAllocations
        )
 where
 
+import Futhark.Util.Pretty (pretty)
 import Debug.Trace
 import Control.Monad.State
 import Control.Monad.Writer
@@ -667,15 +668,16 @@ allocInExp (DoLoop ctx val form body@(Body bodyattrs bodybnds bodyres)) =
       let (spaces, subs) = unzip $ zipWith generalize (zip init_spaces init_ixfuns) (zip res_spaces res_ixfuns)
           init_subs = map (selectSub fst) subs
           res_subs = map (selectSub snd) subs
-      (res_body, res_rets) <- addResCtxInLoopBody body spaces res_subs
+      let body' = Body () bodybnds' (ctxres <> valres)
+      (res_body, res_rets) <- addResCtxInLoopBody body' spaces res_subs
       ((val_ses,valres'),val_retbnds) <- collectStms $ mk_loop_val $ trace (unwords [ "\n\nres_ixfuns:", show res_ixfuns
                                                                                     , "\n\nres_spaces:", show res_spaces
                                                                                     , "\n\nspaces:", show spaces
                                                                                     , "\n\nsubs:", show subs
-                                                                                    , "\n\ninit_subs:", show init_subs
-                                                                                    , "\n\nres_subs:", show res_subs
-                                                                                    -- , "\n\nres_body:", show res_body
-                                                                                    -- , "\n\nres_rets:", show res_rets
+                                                                                    , "\n\ninit_subs:", pretty init_subs
+                                                                                    , "\n\nres_subs:", pretty res_subs
+                                                                                    , "\n\nres_body:", pretty res_body
+                                                                                    , "\n\nres_rets:", pretty res_rets
                                                                                     ]) valres
       return $ Body () (bodybnds'<>val_retbnds) (ctxres++val_ses++valres')
     return $
