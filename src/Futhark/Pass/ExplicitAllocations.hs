@@ -41,6 +41,7 @@ module Futhark.Pass.ExplicitAllocations
        )
 where
 
+import Debug.Trace
 import Control.Monad.State
 import Control.Monad.Writer
 import Control.Monad.Reader
@@ -61,6 +62,9 @@ import Futhark.Optimise.Simplify.Engine (SimpleOps (..))
 import qualified Futhark.Optimise.Simplify.Engine as Engine
 import Futhark.Pass
 import Futhark.Util (splitFromEnd, takeLast)
+
+traceWith :: Show a => String -> a -> a
+traceWith s a = trace (s ++ ": " ++ show a ++ "\n") a
 
 data AllocStm = SizeComputation VName (PrimExp VName)
               | Allocation VName SubExp Space
@@ -627,15 +631,52 @@ allocInStm (Let (Pattern sizeElems valElems) _ e) = do
 
 allocInExp :: (Allocable fromlore tolore, Allocator tolore (AllocM fromlore tolore)) =>
               Exp fromlore -> AllocM fromlore tolore (Exp tolore)
-allocInExp (DoLoop ctx val form (Body () bodybnds bodyres)) =
-  allocInMergeParams mempty ctx $ \_ ctxparams' _ ->
-  allocInMergeParams (map paramName ctxparams') val $
+allocInExp (DoLoop ctx val form body@(Body bodyattrs bodybnds bodyres)) =
+  mapM bodyReturnMIxf (map snd val) >>= \init_ixfuns ->
+  allocInMergeParams mempty (traceWith "ctx" ctx) $ \_ ctxparams' _ ->
+  allocInMergeParams (map paramName ctxparams') (traceWith "val" val) $
   \new_ctx_params valparams' mk_loop_val -> do
-  form' <- allocInLoopForm form
+  init_spaces <- mapM (\x ->
+                         case x of
+                           Just (ArrayIn mem _) -> do
+                             meminfo <- lookupMemInfo mem
+                             case meminfo of
+                               MemMem space -> return $ Just space
+                               _ -> return Nothing
+                           _ -> return Nothing)
+                 init_ixfuns
+  form' <- allocInLoopForm $ trace (unwords [ "init_ixfuns:", show init_ixfuns,
+                                              "\n\ninit_spaces:", show init_spaces,
+                                              "\n\nnew_ctx_params:", show new_ctx_params,
+                                              "\n\nvalparams':", show valparams',
+                                              "\n\nmk_loop_val: N/A\n" ]) $ traceWith "form" form
   localScope (scopeOf form') $ do
     (valinit_ctx, valinit') <- mk_loop_val valinit
-    body' <- insertStmsM $ allocInStms bodybnds $ \bodybnds' -> do
-      ((val_ses,valres'),val_retbnds) <- collectStms $ mk_loop_val valres
+    body' <- insertStmsM $ allocInStms (trace (unwords ["valinit_ctx:", show valinit_ctx,
+                                                        "\n\nvalinit':", show valinit', "\n"]) $ traceWith "bodybnds" bodybnds) $ \bodybnds' -> do
+      res_ixfuns <- mapM bodyReturnMIxf (traceWith ("bodyattrs: " ++ show bodyattrs ++ "\n\nbodyres") (drop (length ctx) bodyres))
+      res_spaces <- mapM (\x ->
+                         case x of
+                           Just (ArrayIn mem _) -> do
+                             meminfo <- lookupMemInfo mem
+                             case meminfo of
+                               MemMem space -> return $ Just space
+                               _ -> return Nothing
+                           _ -> return Nothing)
+                   res_ixfuns
+      let (spaces, subs) = unzip $ zipWith generalize (zip init_spaces init_ixfuns) (zip res_spaces res_ixfuns)
+          init_subs = map (selectSub fst) subs
+          res_subs = map (selectSub snd) subs
+      (res_body, res_rets) <- addResCtxInLoopBody body spaces res_subs
+      ((val_ses,valres'),val_retbnds) <- collectStms $ mk_loop_val $ trace (unwords [ "\n\nres_ixfuns:", show res_ixfuns
+                                                                                    , "\n\nres_spaces:", show res_spaces
+                                                                                    , "\n\nspaces:", show spaces
+                                                                                    , "\n\nsubs:", show subs
+                                                                                    , "\n\ninit_subs:", show init_subs
+                                                                                    , "\n\nres_subs:", show res_subs
+                                                                                    -- , "\n\nres_body:", show res_body
+                                                                                    -- , "\n\nres_rets:", show res_rets
+                                                                                    ]) valres
       return $ Body () (bodybnds'<>val_retbnds) (ctxres++val_ses++valres')
     return $
       DoLoop
@@ -644,7 +685,7 @@ allocInExp (DoLoop ctx val form (Body () bodybnds bodyres)) =
       form' body'
   where (_ctxparams, ctxinit) = unzip ctx
         (_valparams, valinit) = unzip val
-        (ctxres, valres) = splitAt (length ctx) bodyres
+        (ctxres, valres) = splitAt (length ctx) (traceWith "\nbodyres" bodyres)
 allocInExp (Apply fname args rettype loc) = do
   args' <- funcallArgs args
   return $ Apply fname args' (memoryInDeclExtType rettype) loc
@@ -678,37 +719,7 @@ allocInExp (If cond tbranch0 fbranch0 (IfAttr rets ifsort)) = do
         fbranch'' = fbranch' { bodyResult = r_else_ext ++ drop size_ext res_else }
         res_if_expr = If cond tbranch'' fbranch'' $ IfAttr rets'' ifsort
     return res_if_expr
-      where generalize :: (Maybe Space, Maybe MemBind) -> (Maybe Space, Maybe MemBind)
-                       -> (Maybe Space, Maybe (ExtIxFun, [(PrimExp VName, PrimExp VName)]))
-            generalize (Just sp1, Just (ArrayIn _ ixf1)) (Just sp2, Just (ArrayIn _ ixf2)) =
-              if sp1 /= sp2 then (Just sp1, Nothing)
-              else case IxFun.leastGeneralGeneralization ixf1 ixf2 of
-                Just (ixf, m) -> (Just sp1, Just (ixf, m))
-                Nothing -> (Just sp1, Nothing)
-            generalize (mbsp1, _) _ = (mbsp1, Nothing)
 
-            selectSub :: ((a, a) -> a) -> Maybe (ExtIxFun, [(a, a)]) ->
-                         Maybe (ExtIxFun, [a])
-            selectSub f (Just (ixfn, m)) = Just (ixfn, map f m)
-            selectSub _ Nothing = Nothing
-
-            -- | Just introduces the new representation (index functions); but
-            -- does not unify (e.g., does not ensures direct); implementation
-            -- extends `allocInBodyNoDirect`, but also return `MemBind`
-            allocInIfBody :: (Allocable fromlore tolore, Allocator tolore (AllocM fromlore tolore)) =>
-                             Int -> Body fromlore -> AllocM fromlore tolore (Body tolore, [Maybe MemBind])
-            allocInIfBody num_vals (Body _ bnds res) =
-              allocInStms bnds $ \bnds' -> do
-                let (_, val_res) = splitFromEnd num_vals res
-                mem_ixfs <- mapM bodyReturnMIxf val_res
-                return (Body () bnds' res, mem_ixfs)
-                  where
-                    bodyReturnMIxf Constant{} = return Nothing
-                    bodyReturnMIxf (Var v) = do
-                      info <- lookupMemInfo v
-                      case info of
-                        MemArray _ptp _shp _u mem_ixf -> return $ Just mem_ixf
-                        _ -> return Nothing
 allocInExp e = mapExpM alloc e
   where alloc =
           identityMapper { mapOnBody = error "Unhandled Body in ExplicitAllocations"
@@ -719,6 +730,100 @@ allocInExp e = mapExpM alloc e
                          , mapOnOp = \op -> do handle <- asks allocInOp
                                                handle op
                          }
+
+selectSub :: ((a, a) -> a) -> Maybe (ExtIxFun, [(a, a)]) ->
+             Maybe (ExtIxFun, [a])
+selectSub f (Just (ixfn, m)) = Just (ixfn, map f m)
+selectSub _ Nothing = Nothing
+
+
+generalize :: (Maybe Space, Maybe MemBind) -> (Maybe Space, Maybe MemBind)
+           -> (Maybe Space, Maybe (ExtIxFun, [(PrimExp VName, PrimExp VName)]))
+generalize (Just sp1, Just (ArrayIn _ ixf1)) (Just sp2, Just (ArrayIn _ ixf2)) =
+  if sp1 /= sp2 then (Just sp1, Nothing)
+  else case IxFun.leastGeneralGeneralization ixf1 ixf2 of
+    Just (ixf, m) -> (Just sp1, Just (ixf, m))
+    Nothing -> (Just sp1, Nothing)
+generalize (mbsp1, _) _ = (mbsp1, Nothing)
+
+-- | Just introduces the new representation (index functions); but
+-- does not unify (e.g., does not ensures direct); implementation
+-- extends `allocInBodyNoDirect`, but also return `MemBind`
+allocInIfBody :: (Allocable fromlore tolore, Allocator tolore (AllocM fromlore tolore)) =>
+                 Int -> Body fromlore -> AllocM fromlore tolore (Body tolore, [Maybe MemBind])
+allocInIfBody num_vals (Body _ bnds res) =
+  allocInStms bnds $ \bnds' -> do
+    let (_, val_res) = splitFromEnd num_vals res
+    mem_ixfs <- mapM bodyReturnMIxf val_res
+    return (Body () bnds' res, mem_ixfs)
+
+-- bodyReturnMIxf :: (Allocable fromlore tolore, Allocator tolore (AllocM fromlore tolore)) =>
+--                   SubExp -> AllocM fromlore tolore (Maybe MemBind)
+bodyreturnmixf Constant{} = return Nothing
+bodyReturnMIxf (Var v) = do
+  info <- lookupMemInfo v
+  case info of
+    MemArray _ptp _shp _u mem_ixf -> return $ Just mem_ixf
+    _ -> return Nothing
+
+addResCtxInLoopBody :: (Allocable fromlore tolore, Allocator tolore (AllocM fromlore tolore)) =>
+                       Body tolore ->
+                       [Maybe Space] ->
+                       [Maybe (ExtIxFun, [PrimExp VName])] ->
+                       AllocM fromlore tolore (Body tolore, [BodyReturns])
+addResCtxInLoopBody (Body () bnds res) spaces substs = do
+  let num_vals = length substs
+      (ctx_res, val_res) = splitFromEnd num_vals res
+  ((res', bodyrets'), all_body_stms) <- collectStms $ do
+      mapM_ addStm bnds
+      (val_res', ext_ses_res, mem_ctx_res, bodyrets, total_existentials) <-
+        foldM helper ([], [], [], [], length ctx_res) (zip3 val_res substs spaces)
+      return (ctx_res <> ext_ses_res <> mem_ctx_res <> val_res',
+              reverse $ fst $ foldl adjustNewBlockExistential ([], total_existentials) bodyrets)
+  body' <- mkBodyM all_body_stms res'
+  return (body', bodyrets')
+    where
+      helper (res_acc, ext_acc, ctx_acc, br_acc, k) (r, mbixfsub, sp) =
+        case mbixfsub of
+          Nothing -> do
+            r' <- ensureDirect sp r
+            mem_ctx_r <- bodyReturnMemCtx r'
+            r_mem <- subExpMemInfo r'
+            let r_mem' = inspect2 r_mem sp
+            return (res_acc ++ [r'],
+                    ext_acc,
+                    ctx_acc ++ mem_ctx_r,
+                    br_acc ++ [r_mem'],
+                    k)
+          Just (ixfn, m) -> do -- generalizes
+            let i = length m
+            ext_ses <- mapM (primExpToSubExp "ixfn_exist"
+                            (return . BasicOp . SubExp .Var))
+                       m
+            mem_ctx_r <- bodyReturnMemCtx r
+            r_mem <- subExpMemInfo r
+            let sp' = fromMaybe DefaultSpace sp
+                ixfn' = fmap (adjustExtPE k) ixfn
+                exttp = case r_mem of
+                  MemArray pt shape u ret ->
+                    MemArray pt (fmap Free shape) u $
+                        ReturnsNewBlock sp' 0 ixfn'
+                  _ -> error "impossible in addResCtxInLoopBody"
+            return (res_acc ++ [r],
+                    ext_acc ++ ext_ses,
+                    ctx_acc ++ mem_ctx_r,
+                    br_acc ++ [exttp],
+                    k + i)
+
+inspect2 :: MemInfo SubExp u MemBind -> Maybe Space ->  MemInfo (Ext SubExp) u MemReturn
+inspect2 (MemArray pt shape u ret) space =
+  let space' = fromMaybe DefaultSpace space
+      bodyret = MemArray pt (fmap Free shape) u $ ReturnsNewBlock space' 0 $
+        IxFun.iota $ map convert $ fmap Free $ shapeDims shape
+  in bodyret
+inspect2 (MemPrim pt) _ = MemPrim pt
+inspect2 (MemMem space) _ = MemMem space
+
 
 addResCtxInIfBody :: (Allocable fromlore tolore, Allocator tolore (AllocM fromlore tolore)) =>
                      [ExtType] -> Body tolore -> [Maybe Space] ->
@@ -770,28 +875,30 @@ addResCtxInIfBody ifrets (Body _ bnds res) spaces substs = do
                     br_acc ++ [exttp],
                     k + i)
 
-      adjustNewBlockExistential :: ([BodyReturns], Int) -> BodyReturns -> ([BodyReturns], Int)
-      adjustNewBlockExistential (acc, k) (MemArray pt shp u (ReturnsNewBlock space _ ixfun)) =
-        (MemArray pt shp u (ReturnsNewBlock space k ixfun) : acc, k + 1)
-      adjustNewBlockExistential (acc, k) x = (x : acc, k)
+adjustNewBlockExistential :: ([BodyReturns], Int) -> BodyReturns -> ([BodyReturns], Int)
+adjustNewBlockExistential (acc, k) (MemArray pt shp u (ReturnsNewBlock space _ ixfun)) =
+  (MemArray pt shp u (ReturnsNewBlock space k ixfun) : acc, k + 1)
+adjustNewBlockExistential (acc, k) x = (x : acc, k)
 
-      inspect (Array pt shape u) space =
-        let space' = fromMaybe DefaultSpace space
-            bodyret = MemArray pt shape u $ ReturnsNewBlock space' 0 $
-              IxFun.iota $ map convert $ shapeDims shape
-        in bodyret
-      inspect (Prim pt) _ = MemPrim pt
-      inspect (Mem space) _ = MemMem space
+inspect :: TypeBase (ShapeBase (Ext SubExp)) u -> Maybe Space -> MemInfo (Ext SubExp) u MemReturn
+inspect (Array pt shape u) space =
+  let space' = fromMaybe DefaultSpace space
+      bodyret = MemArray pt shape u $ ReturnsNewBlock space' 0 $
+        IxFun.iota $ map convert $ shapeDims shape
+  in bodyret
+inspect (Prim pt) _ = MemPrim pt
+inspect (Mem space) _ = MemMem space
 
-      convert (Ext i) = LeafExp (Ext i) int32
-      convert (Free v) = Free <$> primExpFromSubExp int32 v
+convert :: Ext SubExp -> PrimExp (Ext VName)
+convert (Ext i) = LeafExp (Ext i) int32
+convert (Free v) = Free <$> primExpFromSubExp int32 v
 
-      adjustExtV :: Int -> Ext VName -> Ext VName
-      adjustExtV _ (Free v) = Free v
-      adjustExtV k (Ext i) = Ext (k + i)
+adjustExtV :: Int -> Ext VName -> Ext VName
+adjustExtV _ (Free v) = Free v
+adjustExtV k (Ext i) = Ext (k + i)
 
-      adjustExtPE :: Int -> PrimExp (Ext VName) -> PrimExp (Ext VName)
-      adjustExtPE k = fmap (adjustExtV k)
+adjustExtPE :: Int -> PrimExp (Ext VName) -> PrimExp (Ext VName)
+adjustExtPE k = fmap (adjustExtV k)
 
 mkSpaceOks :: (Mem tolore, LocalScope tolore m) =>
               Int -> Body tolore -> m [Maybe Space]
