@@ -759,9 +759,9 @@ allocInIfBody num_vals (Body _ bnds res) =
     mem_ixfs <- mapM bodyReturnMIxf val_res
     return (Body () bnds' res, mem_ixfs)
 
--- bodyReturnMIxf :: (Allocable fromlore tolore, Allocator tolore (AllocM fromlore tolore)) =>
---                   SubExp -> AllocM fromlore tolore (Maybe MemBind)
-bodyreturnmixf Constant{} = return Nothing
+bodyReturnMIxf :: (Allocable fromlore tolore, Allocator tolore (AllocM fromlore tolore)) =>
+                  SubExp -> AllocM fromlore tolore (Maybe MemBind)
+bodyReturnMIxf Constant{} = return Nothing
 bodyReturnMIxf (Var v) = do
   info <- lookupMemInfo v
   case info of
