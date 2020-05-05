@@ -668,8 +668,12 @@ allocInExp (DoLoop ctx val form body@(Body bodyattrs bodybnds bodyres)) = do
         res_subs = map (selectSub snd) subs
     (ctx', val') <- addResCtxInLoopMerge val spaces res_subs
     (body'', rets') <- addResCtxInLoopBody body' spaces res_subs
-    undefined
-
+    return $
+      DoLoop
+      (ctx <> ctx')
+      (val <> val')
+      form'
+      body''
 
 allocInExp (DoLoop ctx val form body@(Body bodyattrs bodybnds bodyres)) =
   mapM bodyReturnMIxf (map snd val) >>= \init_ixfuns ->
