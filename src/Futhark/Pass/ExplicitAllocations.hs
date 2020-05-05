@@ -632,7 +632,85 @@ allocInStm (Let (Pattern sizeElems valElems) _ e) = do
 
 allocInExp :: (Allocable fromlore tolore, Allocator tolore (AllocM fromlore tolore)) =>
               Exp fromlore -> AllocM fromlore tolore (Exp tolore)
+allocInExp (DoLoop ctx vals form body@(Body bodyattrs bodybnds bodyres)) = do
+  let ctx' = traceWith "ctx'" $ map allocInCtx ctx
+  init_ixfuns <- mapM bodyReturnMIxf $ map snd vals
+  init_spaces <- mapM ixfunSpace init_ixfuns
+  form' <- allocInLoopForm $
+           traceWith "form" form
+  let (body', init_spaces_and_subs) = pairM $ allocInStms bodybnds $ allocInLoopBodyBinds (zip init_spaces init_ixfuns)
+  body'' <- insertStmsM body'
+  (init_spaces', init_subs) <- init_spaces_and_subs
+  (newctx, vals', _)  <- foldM substituteInVal ([], [], 0) $ zip3 vals init_spaces' init_subs
+  return $
+    DoLoop
+    (ctx' <> newctx)
+    undefined -- vals'
+    form'
+    body''
+  where
+    pairM :: Monad m => m (a, b) -> (m a, m b)
+    pairM m =
+      (fst <$> m, snd <$> m)
+
+    allocInCtx :: (Param DeclType, subexp) -> (Param (MemBound uniqueness), subexp)
+    allocInCtx (param, subexp) =
+      case paramDeclType param of
+        Prim bt -> (param { paramAttr = MemPrim bt }, subexp)
+        Mem space -> (param { paramAttr = MemMem space }, subexp)
+        Array _ _ _ -> error "Impossible, context cannot contain array"
+
+    ixfunSpace x =
+      case x of
+        Just (ArrayIn mem _) -> do
+          meminfo <- lookupMemInfo mem
+          case meminfo of
+            MemMem space -> return $ Just space
+            _ -> return Nothing
+        _ -> return Nothing
+    allocInLoopBodyBinds init_res_and_ixfuns bodybnds = do
+      bodyres_ixfuns <- mapM bodyReturnMIxf $ drop (length ctx) bodyres
+      bodyres_spaces <- mapM ixfunSpace bodyres_ixfuns
+      let (spaces, subs) = unzip $
+                           zipWith generalize
+                           init_res_and_ixfuns
+                           (zip bodyres_spaces bodyres_ixfuns)
+          init_subs = map (selectSub fst) subs
+          res_subs = map (selectSub snd) subs
+          body' = Body () bodybnds bodyres
+      res_body <- addResCtxInLoopBody body' spaces res_subs
+      return (res_body, (spaces, init_subs))
+
+    substituteInVal (ctx_acc, val_acc, k) ((param, val), space, subst) =
+      case subst of
+        Nothing -> do -- Does not generalize
+          val' <- ensureDirect space val
+          let space' = fromMaybe DefaultSpace space
+          -- (param', param_mem) <- runWriterT $ allocInFParam param space'
+          param' <- undefined
+          return $ (ctx_acc,
+                    val_acc ++ [(param', val')],
+                    k)
+        Just (ixfun, m) -> do -- Generalizes
+          let i = length m
+              space' = fromMaybe DefaultSpace space
+              ixfun' = fmap (adjustExtPE k) ixfun
+              param' = case paramDeclType param of
+                Array pt shape u ->
+                  param { paramAttr = MemArray pt (fmap Free shape) u $
+                                      ReturnsNewBlock space' 0 ixfun' }
+                _ -> error "impossible in substituteInVal"
+          existentials <- mapM (primExpToSubExp "ixfn_exist"
+                            (return . BasicOp . SubExp . Var))
+                          m
+          return $
+            (ctx_acc ++ zip undefined existentials,
+             val_acc ++ [(param', val)],
+             k + i)
+
+
 allocInExp (DoLoop ctx val form body@(Body bodyattrs bodybnds bodyres)) =
+
   mapM bodyReturnMIxf (map snd val) >>= \init_ixfuns ->
   allocInMergeParams mempty (traceWith "ctx" ctx) $ \_ ctxparams' _ ->
   allocInMergeParams (map paramName ctxparams') (traceWith "val" val) $
@@ -648,6 +726,7 @@ allocInExp (DoLoop ctx val form body@(Body bodyattrs bodybnds bodyres)) =
                  init_ixfuns
   form' <- allocInLoopForm $ trace (unwords [ "init_ixfuns:", show init_ixfuns,
                                               "\n\ninit_spaces:", show init_spaces,
+                                              "\n\nctxparams':", show ctxparams',
                                               "\n\nnew_ctx_params:", show new_ctx_params,
                                               "\n\nvalparams':", show valparams',
                                               "\n\nmk_loop_val: N/A\n" ]) $ traceWith "form" form
@@ -669,15 +748,13 @@ allocInExp (DoLoop ctx val form body@(Body bodyattrs bodybnds bodyres)) =
           init_subs = map (selectSub fst) subs
           res_subs = map (selectSub snd) subs
       let body' = Body () bodybnds' (ctxres <> valres)
-      (res_body, res_rets) <- addResCtxInLoopBody body' spaces res_subs
+      (res_body, res_rets) <- undefined
       ((val_ses,valres'),val_retbnds) <- collectStms $ mk_loop_val $ trace (unwords [ "\n\nres_ixfuns:", show res_ixfuns
                                                                                     , "\n\nres_spaces:", show res_spaces
                                                                                     , "\n\nspaces:", show spaces
                                                                                     , "\n\nsubs:", show subs
                                                                                     , "\n\ninit_subs:", pretty init_subs
                                                                                     , "\n\nres_subs:", pretty res_subs
-                                                                                    , "\n\nres_body:", pretty res_body
-                                                                                    , "\n\nres_rets:", pretty res_rets
                                                                                     ]) valres
       return $ Body () (bodybnds'<>val_retbnds) (ctxres++val_ses++valres')
     return $
@@ -772,7 +849,7 @@ addResCtxInLoopBody :: (Allocable fromlore tolore, Allocator tolore (AllocM from
                        Body tolore ->
                        [Maybe Space] ->
                        [Maybe (ExtIxFun, [PrimExp VName])] ->
-                       AllocM fromlore tolore (Body tolore, [BodyReturns])
+                       AllocM fromlore tolore (Body tolore)
 addResCtxInLoopBody (Body () bnds res) spaces substs = do
   let num_vals = length substs
       (ctx_res, val_res) = splitFromEnd num_vals res
@@ -783,7 +860,7 @@ addResCtxInLoopBody (Body () bnds res) spaces substs = do
       return (ctx_res <> ext_ses_res <> mem_ctx_res <> val_res',
               reverse $ fst $ foldl adjustNewBlockExistential ([], total_existentials) bodyrets)
   body' <- mkBodyM all_body_stms res'
-  return (body', bodyrets')
+  return body'
     where
       helper (res_acc, ext_acc, ctx_acc, br_acc, k) (r, mbixfsub, sp) =
         case mbixfsub of
