@@ -632,6 +632,45 @@ allocInStm (Let (Pattern sizeElems valElems) _ e) = do
 
 allocInExp :: (Allocable fromlore tolore, Allocator tolore (AllocM fromlore tolore)) =>
               Exp fromlore -> AllocM fromlore tolore (Exp tolore)
+allocInExp (DoLoop ctx val form body@(Body bodyattrs bodybnds bodyres)) = do
+  -- allocinMergeParams ctx. Vi ved ikke helt hvad den gør...
+  -- Next, let's extract the index functions from `val` and the index functions from `body`
+  -- Antiunify pairs of index functions
+  -- For each pair, if there is no antiunification:
+  --   linearize index functions in val, write statements to do so
+  --   Linearize index functions in bodybnds, add those to bodyres
+  -- If there is an antiunficication
+  --   Write the necessary parameters to ctx and res, both in val and body
+  init_ixfuns <- mapM bodyReturnMIxf (map snd val)
+  init_spaces <- mapM (\x ->
+                         case x of
+                           Just (ArrayIn mem _) -> do
+                             meminfo <- lookupMemInfo mem
+                             case meminfo of
+                               MemMem space -> return $ Just space
+                               _ -> return Nothing
+                           _ -> return Nothing)
+                 init_ixfuns
+  form' <- allocInLoopForm form
+  localScope (scopeOf form') $ do
+    (body', res_ixfuns) <- allocInIfBody (length val) body
+    res_spaces <- mapM (\x ->
+                          case x of
+                            Just (ArrayIn mem _) -> do
+                              meminfo <- lookupMemInfo mem
+                              case meminfo of
+                                MemMem space -> return $ Just space
+                                _ -> return Nothing
+                            _ -> return Nothing)
+                     res_ixfuns
+    let (spaces, subs) = unzip $ zipWith generalize (zip init_spaces init_ixfuns) (zip res_spaces res_ixfuns)
+        init_subs = map (selectSub fst) subs
+        res_subs = map (selectSub snd) subs
+    (ctx', val') <- addResCtxInLoopMerge val spaces res_subs
+    (body'', rets') <- addResCtxInLoopBody body' spaces res_subs
+    undefined
+
+
 allocInExp (DoLoop ctx val form body@(Body bodyattrs bodybnds bodyres)) =
   mapM bodyReturnMIxf (map snd val) >>= \init_ixfuns ->
   allocInMergeParams mempty (traceWith "ctx" ctx) $ \_ ctxparams' _ ->
@@ -688,6 +727,8 @@ allocInExp (DoLoop ctx val form body@(Body bodyattrs bodybnds bodyres)) =
   where (_ctxparams, ctxinit) = unzip ctx
         (_valparams, valinit) = unzip val
         (ctxres, valres) = splitAt (length ctx) (traceWith "\nbodyres" bodyres)
+
+
 allocInExp (Apply fname args rettype loc) = do
   args' <- funcallArgs args
   return $ Apply fname args' (memoryInDeclExtType rettype) loc
@@ -767,6 +808,25 @@ bodyReturnMIxf (Var v) = do
   case info of
     MemArray _ptp _shp _u mem_ixf -> return $ Just mem_ixf
     _ -> return Nothing
+
+-- addResCtxInLoopMerge :: (Allocable fromlore tolore, Allocator tolore (AllocM fromlore tolore)) =>
+--                         [(FParam lore, SubExp)] ->
+--                         [Maybe Space] ->
+--                         [Maybe (ExtIxFun, [PrimExp VName])] ->
+--                         AllocM fromlore tolore ([SubExp], [SubExp])
+addResCtxInLoopMerge vals spaces substs = do
+  foldM helper ([], []) $ zip3 vals spaces substs
+  where
+    helper (res_acc, ext_acc) ((_, subexp), space, subst) =
+      case subst of
+        Nothing -> do -- Does not generalize
+          r' <- ensureDirect space subexp
+          return (res_acc ++ [r'], ext_acc)
+        Just (xfun, m) -> do
+          existentials <- mapM (primExpToSubExp "ixfn_exist"
+                               (return . BasicOp . SubExp . Var))
+                          m
+          return (res_acc ++ [subexp], ext_acc ++ existentials)
 
 addResCtxInLoopBody :: (Allocable fromlore tolore, Allocator tolore (AllocM fromlore tolore)) =>
                        Body tolore ->
