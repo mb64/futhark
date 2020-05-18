@@ -631,20 +631,33 @@ allocInExp :: (Allocable fromlore tolore, Allocator tolore (AllocM fromlore tolo
               Exp fromlore -> AllocM fromlore tolore (Exp tolore)
 allocInExp (DoLoop ctx vals form body@(Body bodyattrs bodybnds bodyres)) = do
   let ctx' = traceWith "ctx'" $ map allocInCtx ctx
-  init_ixfuns <- mapM bodyReturnMIxf $ map snd vals
-  init_spaces <- mapM ixfunSpace init_ixfuns
+  init_ixfuns <- mapM bodyReturnMIxf $ map snd  $ traceWith "vals" vals
+  init_spaces <- mapM ixfunSpace $ traceWith "init_ixfuns" init_ixfuns
   form' <- allocInLoopForm $
-           traceWith "form" form
-  let (body', init_spaces_and_subs) = pairM $ allocInStms bodybnds $ allocInLoopBodyBinds (zip init_spaces init_ixfuns)
-  body'' <- insertStmsM body'
-  (init_spaces', init_subs) <- init_spaces_and_subs
-  (newctx, vals')  <- foldM substituteInVal ([], []) $ zip3 vals init_spaces' init_subs
-  return $
-    DoLoop
-    (ctx' <> newctx)
-    vals'
-    form'
-    body''
+           trace (unwords ["form: ", show form,
+                           "\n\ninit_ixfuns: ", show init_ixfuns,
+                           "\n\ninit_spaces: ", show init_spaces]) form
+  localScope (scopeOf $ traceWith "localScope.form'" form') $ do
+    -- The variables from vals are not in scope when trying to compute allocInStms, and so this crashes.
+    let (body', init_spaces_and_subs) = pairM $
+                                        trace "or here?"
+                                        allocInStms (traceWith "bodybnds:" bodybnds) $
+                                        trace "Did we get to here?"
+                                        allocInLoopBodyBinds $
+                                        trace (unwords ["form blab: ", show form,
+                                                        "\n\ninit_ixfuns: ", show init_ixfuns,
+                                                        "\n\ninit_spaces: ", show init_spaces,
+                                                        "\n\nform': ", show form']) $
+                                        zip init_spaces init_ixfuns
+    body'' <- insertStmsM body'
+    (init_spaces', init_subs) <- init_spaces_and_subs
+    (newctx, vals')  <- foldM substituteInVal ([], []) $ zip3 vals init_spaces' init_subs
+    return $
+      DoLoop
+      (ctx' <> newctx)
+      vals'
+      (traceWith "form'" form')
+      body''
   where
     pairM :: Monad m => m (a, b) -> (m a, m b)
     pairM m =
@@ -668,15 +681,15 @@ allocInExp (DoLoop ctx vals form body@(Body bodyattrs bodybnds bodyres)) = do
     ixfunSpace x =
       case x of
         Just (ArrayIn mem _) -> do
-          meminfo <- lookupMemInfo mem
+          meminfo <- lookupMemInfo $ traceWith "looking it up" mem
           case meminfo of
-            MemMem space -> return $ Just space
-            _ -> return Nothing
-        _ -> return Nothing
+            MemMem space -> return $ Just $ traceWith "returning it" space
+            _ -> return $ traceWith "returning it 2" Nothing
+        _ -> return $ traceWith "returning it 3" Nothing
 
     allocInLoopBodyBinds init_res_and_ixfuns bodybnds = do
-      bodyres_ixfuns <- mapM bodyReturnMIxf $ drop (length ctx) bodyres
-      bodyres_spaces <- mapM ixfunSpace bodyres_ixfuns
+      bodyres_ixfuns <- mapM bodyReturnMIxf $ drop (length ctx) $ traceWith "allocInLoopBodyBinds.bodyres" bodyres
+      bodyres_spaces <- mapM ixfunSpace $ traceWith "allocInLoopBodyBinds.bodyres_ixfuns" bodyres_ixfuns
       let (spaces, subs) = unzip $
                            zipWith generalize
                            init_res_and_ixfuns
@@ -684,7 +697,7 @@ allocInExp (DoLoop ctx vals form body@(Body bodyattrs bodybnds bodyres)) = do
           init_subs = map (selectSub fst) subs
           res_subs = map (selectSub snd) subs
           body' = Body () bodybnds bodyres
-      res_body <- addResCtxInLoopBody body' spaces res_subs
+      res_body <- addResCtxInLoopBody body' spaces $ traceWith "going to add res on res_subs" res_subs
       return (res_body, (spaces, init_subs))
 
     -- generalize :: (Maybe Space, Maybe MemBind) -> (Maybe Space, Maybe MemBind)
@@ -977,10 +990,10 @@ allocInLoopForm (WhileLoop v) = return $ WhileLoop v
 allocInLoopForm (ForLoop i it n loopvars) =
   ForLoop i it n <$> mapM allocInLoopVar loopvars
   where allocInLoopVar (p,a) = do
-          (mem, ixfun) <- lookupArraySummary a
           case paramType p of
             Array bt shape u -> do
-              dims <- map (primExpFromSubExp int32) . arrayDims <$> lookupType a
+              (mem, ixfun) <- lookupArraySummary $ traceWith "looking up" a
+              dims <- map (primExpFromSubExp int32) . arrayDims <$> lookupType (traceWith "looking up 2" a)
               let ixfun' = IxFun.slice ixfun $
                            fullSliceNum dims [DimFix $ LeafExp i int32]
               return (p { paramAttr = MemArray bt shape u $ ArrayIn mem ixfun' }, a)
