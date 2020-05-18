@@ -415,7 +415,7 @@ allocInFParam param pspace =
       tell [Param mem $ MemMem pspace]
       return param { paramAttr =  MemArray bt shape u $ ArrayIn mem ixfun }
     Prim bt ->
-      return param { paramAttr = MemPrim bt }
+      return param { paramAttr  = MemPrim bt }
     Mem space ->
       return param { paramAttr = MemMem space }
 
@@ -566,9 +566,6 @@ memoryInDeclExtType ts = evalState (mapM addAttr ts) $ startOfFreeIDRange ts
           return $ MemArray bt shape u $ ReturnsNewBlock DefaultSpace i $
             IxFun.iota $ map convert $ shapeDims shape
 
-        convert (Ext i) = LeafExp (Ext i) int32
-        convert (Free v) = Free <$> primExpFromSubExp int32 v
-
 startOfFreeIDRange :: [TypeBase ExtShape u] -> Int
 startOfFreeIDRange = S.size . shapeContext
 
@@ -641,11 +638,11 @@ allocInExp (DoLoop ctx vals form body@(Body bodyattrs bodybnds bodyres)) = do
   let (body', init_spaces_and_subs) = pairM $ allocInStms bodybnds $ allocInLoopBodyBinds (zip init_spaces init_ixfuns)
   body'' <- insertStmsM body'
   (init_spaces', init_subs) <- init_spaces_and_subs
-  (newctx, vals', _)  <- foldM substituteInVal ([], [], 0) $ zip3 vals init_spaces' init_subs
+  (newctx, vals')  <- foldM substituteInVal ([], []) $ zip3 vals init_spaces' init_subs
   return $
     DoLoop
     (ctx' <> newctx)
-    undefined -- vals'
+    vals'
     form'
     body''
   where
@@ -653,12 +650,20 @@ allocInExp (DoLoop ctx vals form body@(Body bodyattrs bodybnds bodyres)) = do
     pairM m =
       (fst <$> m, snd <$> m)
 
-    allocInCtx :: (Param DeclType, subexp) -> (Param (MemBound uniqueness), subexp)
+    -- allocInCtx :: (Param DeclType, subexp) -> (Param (MemBound uniqueness), subexp)
     allocInCtx (param, subexp) =
       case paramDeclType param of
         Prim bt -> (param { paramAttr = MemPrim bt }, subexp)
         Mem space -> (param { paramAttr = MemMem space }, subexp)
         Array _ _ _ -> error "Impossible, context cannot contain array"
+
+    allocInParam' :: (Allocable fromlore tolore, Allocator tolore (AllocM fromlore tolore)) =>
+                   Space -> FParam fromlore -> AllocM fromlore tolore (FParam tolore)
+    allocInParam' space param =
+      case paramDeclType param of
+        Prim bt -> return $ param { paramAttr = MemPrim bt }
+        Mem space' -> return $ param { paramAttr = MemMem space' }
+        Array pt shape u -> error "Impossible in allocInParam'"
 
     ixfunSpace x =
       case x of
@@ -668,6 +673,7 @@ allocInExp (DoLoop ctx vals form body@(Body bodyattrs bodybnds bodyres)) = do
             MemMem space -> return $ Just space
             _ -> return Nothing
         _ -> return Nothing
+
     allocInLoopBodyBinds init_res_and_ixfuns bodybnds = do
       bodyres_ixfuns <- mapM bodyReturnMIxf $ drop (length ctx) bodyres
       bodyres_spaces <- mapM ixfunSpace bodyres_ixfuns
@@ -681,90 +687,67 @@ allocInExp (DoLoop ctx vals form body@(Body bodyattrs bodybnds bodyres)) = do
       res_body <- addResCtxInLoopBody body' spaces res_subs
       return (res_body, (spaces, init_subs))
 
-    substituteInVal (ctx_acc, val_acc, k) ((param, val), space, subst) =
+    -- generalize :: (Maybe Space, Maybe MemBind) -> (Maybe Space, Maybe MemBind)
+    --            -> (Maybe Space, Maybe (IxFun, [(PrimExp VName, PrimExp VName)]))
+    -- generalize (Just sp1, Just (ArrayIn _ ixf1)) (Just sp2, Just (ArrayIn _ ixf2)) =
+    --   if sp1 /= sp2 then (Just sp1, Nothing)
+    --   else case IxFun.leastGeneralGeneralization ixf1 ixf2 of
+    --     Just (ixf, m) -> (Just sp1, Just (ixf, m))
+    --     Nothing -> (Just sp1, Nothing)
+    -- generalize (mbsp1, _) _ = (mbsp1, Nothing)
+
+    generalize :: (Maybe Space, Maybe MemBind) -> (Maybe Space, Maybe MemBind)
+               -> (Maybe Space, Maybe (ExtIxFun, [(PrimExp VName, PrimExp VName)]))
+    generalize (Just sp1, Just (ArrayIn _ ixf1)) (Just sp2, Just (ArrayIn _ ixf2)) =
+      if sp1 /= sp2 then (Just sp1, Nothing)
+      else case IxFun.leastGeneralGeneralization ixf1 ixf2 of
+             Just (ixf, m) -> (Just sp1, Just (ixf, m))
+             Nothing -> (Just sp1, Nothing)
+    generalize (mbsp1, _) _ = (mbsp1, Nothing)
+
+
+    substituteInVal :: (Allocable fromlore tolore,
+                         Allocator tolore (AllocM fromlore tolore)) =>
+                       ([(FParam tolore, SubExp)], [(FParam tolore, SubExp)])
+                    -> ((FParam fromlore, SubExp), Maybe Space, Maybe (ExtIxFun, [PrimExp VName]))
+                    -> AllocM
+                       fromlore
+                       tolore
+                       ([(FParam tolore, SubExp)], [(FParam tolore, SubExp)])
+    substituteInVal (ctx_acc, val_acc) ((param, val), space, subst) =
       case subst of
         Nothing -> do -- Does not generalize
           val' <- ensureDirect space val
           let space' = fromMaybe DefaultSpace space
-          -- (param', param_mem) <- runWriterT $ allocInFParam param space'
-          param' <- undefined
+          param' <- allocInParam' space' param
           return $ (ctx_acc,
-                    val_acc ++ [(param', val')],
-                    k)
+                    val_acc ++ [(param', val')])
         Just (ixfun, m) -> do -- Generalizes
           let i = length m
-              space' = fromMaybe DefaultSpace space
-              ixfun' = fmap (adjustExtPE k) ixfun
-              param' = case paramDeclType param of
-                Array pt shape u ->
-                  param { paramAttr = MemArray pt (fmap Free shape) u $
-                                      ReturnsNewBlock space' 0 ixfun' }
+              ixfun' = IxFun.substituteInIxFun (M.fromList $ zip (fmap Ext [0..]) (fmap (fmap Free) m)) ixfun
+          ixfun'' <- trace ("ixfun: " ++ show ixfun ++ "\n\nm: " ++ show m++"\n\n") instantiateIxFun ixfun'
+          param' <- case paramDeclType param of
+                Array pt shape u -> do
+                  vname <- newVName "existential_param"
+                  return $ param { paramAttr = MemArray pt shape u $ ArrayIn vname ixfun'' }
                 _ -> error "impossible in substituteInVal"
           existentials <- mapM (primExpToSubExp "ixfn_exist"
-                            (return . BasicOp . SubExp . Var))
+                                (return . BasicOp . SubExp . Var))
                           m
+          existential_params <- mapM (\existential -> do
+                                         meminfo <- subExpMemInfo existential
+                                         let meminfo' =
+                                               case meminfo of
+                                                 MemPrim pt -> MemPrim pt
+                                                 MemMem sp -> MemMem sp
+                                                 MemArray _ _ _ _ -> error "impossible existential_params"
+                                         newParam "existential_param" $ meminfo')
+                                existentials
           return $
-            (ctx_acc ++ zip undefined existentials,
-             val_acc ++ [(param', val)],
-             k + i)
+            (ctx_acc ++ zip existential_params
+              existentials,
+             val_acc ++ [(param', val)])
 
-
-allocInExp (DoLoop ctx val form body@(Body bodyattrs bodybnds bodyres)) =
-
-  mapM bodyReturnMIxf (map snd val) >>= \init_ixfuns ->
-  allocInMergeParams mempty (traceWith "ctx" ctx) $ \_ ctxparams' _ ->
-  allocInMergeParams (map paramName ctxparams') (traceWith "val" val) $
-  \new_ctx_params valparams' mk_loop_val -> do
-  init_spaces <- mapM (\x ->
-                         case x of
-                           Just (ArrayIn mem _) -> do
-                             meminfo <- lookupMemInfo mem
-                             case meminfo of
-                               MemMem space -> return $ Just space
-                               _ -> return Nothing
-                           _ -> return Nothing)
-                 init_ixfuns
-  form' <- allocInLoopForm $ trace (unwords [ "init_ixfuns:", show init_ixfuns,
-                                              "\n\ninit_spaces:", show init_spaces,
-                                              "\n\nctxparams':", show ctxparams',
-                                              "\n\nnew_ctx_params:", show new_ctx_params,
-                                              "\n\nvalparams':", show valparams',
-                                              "\n\nmk_loop_val: N/A\n" ]) $ traceWith "form" form
-  localScope (scopeOf form') $ do
-    (valinit_ctx, valinit') <- mk_loop_val valinit
-    body' <- insertStmsM $ allocInStms (trace (unwords ["valinit_ctx:", show valinit_ctx,
-                                                        "\n\nvalinit':", show valinit', "\n"]) $ traceWith "bodybnds" bodybnds) $ \bodybnds' -> do
-      res_ixfuns <- mapM bodyReturnMIxf (traceWith ("bodyattrs: " ++ show bodyattrs ++ "\n\nbodyres") (drop (length ctx) bodyres))
-      res_spaces <- mapM (\x ->
-                         case x of
-                           Just (ArrayIn mem _) -> do
-                             meminfo <- lookupMemInfo mem
-                             case meminfo of
-                               MemMem space -> return $ Just space
-                               _ -> return Nothing
-                           _ -> return Nothing)
-                   res_ixfuns
-      let (spaces, subs) = unzip $ zipWith generalize (zip init_spaces init_ixfuns) (zip res_spaces res_ixfuns)
-          init_subs = map (selectSub fst) subs
-          res_subs = map (selectSub snd) subs
-      let body' = Body () bodybnds' (ctxres <> valres)
-      (res_body, res_rets) <- undefined
-      ((val_ses,valres'),val_retbnds) <- collectStms $ mk_loop_val $ trace (unwords [ "\n\nres_ixfuns:", show res_ixfuns
-                                                                                    , "\n\nres_spaces:", show res_spaces
-                                                                                    , "\n\nspaces:", show spaces
-                                                                                    , "\n\nsubs:", show subs
-                                                                                    , "\n\ninit_subs:", pretty init_subs
-                                                                                    , "\n\nres_subs:", pretty res_subs
-                                                                                    ]) valres
-      return $ Body () (bodybnds'<>val_retbnds) (ctxres++val_ses++valres')
-    return $
-      DoLoop
-      (zip (ctxparams'++new_ctx_params) (ctxinit++valinit_ctx))
-      (zip valparams' valinit')
-      form' body'
-  where (_ctxparams, ctxinit) = unzip ctx
-        (_valparams, valinit) = unzip val
-        (ctxres, valres) = splitAt (length ctx) (traceWith "\nbodyres" bodyres)
 allocInExp (Apply fname args rettype loc) = do
   args' <- funcallArgs args
   return $ Apply fname args' (memoryInDeclExtType rettype) loc
@@ -798,6 +781,16 @@ allocInExp (If cond tbranch0 fbranch0 (IfAttr rets ifsort)) = do
         fbranch'' = fbranch' { bodyResult = r_else_ext ++ drop size_ext res_else }
         res_if_expr = If cond tbranch'' fbranch'' $ IfAttr rets'' ifsort
     return res_if_expr
+      where
+        generalize :: (Maybe Space, Maybe MemBind) -> (Maybe Space, Maybe MemBind)
+                   -> (Maybe Space, Maybe (ExtIxFun, [(PrimExp VName, PrimExp VName)]))
+        generalize (Just sp1, Just (ArrayIn _ ixf1)) (Just sp2, Just (ArrayIn _ ixf2)) =
+          if sp1 /= sp2 then (Just sp1, Nothing)
+          else case IxFun.leastGeneralGeneralization ixf1 ixf2 of
+            Just (ixf, m) -> (Just sp1, Just (ixf, m))
+            Nothing -> (Just sp1, Nothing)
+        generalize (mbsp1, _) _ = (mbsp1, Nothing)
+
 
 allocInExp e = mapExpM alloc e
   where alloc =
@@ -814,16 +807,6 @@ selectSub :: ((a, a) -> a) -> Maybe (ExtIxFun, [(a, a)]) ->
              Maybe (ExtIxFun, [a])
 selectSub f (Just (ixfn, m)) = Just (ixfn, map f m)
 selectSub _ Nothing = Nothing
-
-
-generalize :: (Maybe Space, Maybe MemBind) -> (Maybe Space, Maybe MemBind)
-           -> (Maybe Space, Maybe (ExtIxFun, [(PrimExp VName, PrimExp VName)]))
-generalize (Just sp1, Just (ArrayIn _ ixf1)) (Just sp2, Just (ArrayIn _ ixf2)) =
-  if sp1 /= sp2 then (Just sp1, Nothing)
-  else case IxFun.leastGeneralGeneralization ixf1 ixf2 of
-    Just (ixf, m) -> (Just sp1, Just (ixf, m))
-    Nothing -> (Just sp1, Nothing)
-generalize (mbsp1, _) _ = (mbsp1, Nothing)
 
 -- | Just introduces the new representation (index functions); but
 -- does not unify (e.g., does not ensures direct); implementation
@@ -845,24 +828,23 @@ bodyReturnMIxf (Var v) = do
     MemArray _ptp _shp _u mem_ixf -> return $ Just mem_ixf
     _ -> return Nothing
 
-addResCtxInLoopBody :: (Allocable fromlore tolore, Allocator tolore (AllocM fromlore tolore)) =>
-                       Body tolore ->
-                       [Maybe Space] ->
-                       [Maybe (ExtIxFun, [PrimExp VName])] ->
-                       AllocM fromlore tolore (Body tolore)
+-- addResCtxInLoopBody :: (Allocable fromlore tolore, Allocator tolore (AllocM fromlore tolore)) =>
+--                        Body tolore ->
+--                        [Maybe Space] ->
+--                        [Maybe (ExtIxFun, [PrimExp VName])] ->
+--                        AllocM fromlore tolore (Body tolore)
 addResCtxInLoopBody (Body () bnds res) spaces substs = do
   let num_vals = length substs
       (ctx_res, val_res) = splitFromEnd num_vals res
-  ((res', bodyrets'), all_body_stms) <- collectStms $ do
+  (res', all_body_stms) <- collectStms $ do
       mapM_ addStm bnds
-      (val_res', ext_ses_res, mem_ctx_res, bodyrets, total_existentials) <-
-        foldM helper ([], [], [], [], length ctx_res) (zip3 val_res substs spaces)
-      return (ctx_res <> ext_ses_res <> mem_ctx_res <> val_res',
-              reverse $ fst $ foldl adjustNewBlockExistential ([], total_existentials) bodyrets)
+      (val_res', ext_ses_res, mem_ctx_res) <-
+        foldM helper ([], [], []) (zip3 val_res substs spaces)
+      return $ ctx_res <> ext_ses_res <> mem_ctx_res <> val_res'
   body' <- mkBodyM all_body_stms res'
   return body'
     where
-      helper (res_acc, ext_acc, ctx_acc, br_acc, k) (r, mbixfsub, sp) =
+      helper (res_acc, ext_acc, ctx_acc) (r, mbixfsub, sp) =
         case mbixfsub of
           Nothing -> do
             r' <- ensureDirect sp r
@@ -871,28 +853,23 @@ addResCtxInLoopBody (Body () bnds res) spaces substs = do
             let r_mem' = inspect2 r_mem sp
             return (res_acc ++ [r'],
                     ext_acc,
-                    ctx_acc ++ mem_ctx_r,
-                    br_acc ++ [r_mem'],
-                    k)
+                    ctx_acc ++ mem_ctx_r)
           Just (ixfn, m) -> do -- generalizes
+            -- Not needed since we only return a subexp from here, the index function is derived from the merge parameters
+            -- ixfun' <- instantiateIxFun $ IxFun.substituteInIxFun m ixfun
+            -- param' <- case paramDeclType param of
+            --             Array pt shape u -> do
+            --               vname <- newVName "existential_param"
+            --               param { paramAttr = MemArray pt shape u $ ArrayIn vname ixfun' }
+            --             _ -> error "impossible in substituteInVal"
             let i = length m
             ext_ses <- mapM (primExpToSubExp "ixfn_exist"
                             (return . BasicOp . SubExp .Var))
                        m
             mem_ctx_r <- bodyReturnMemCtx r
-            r_mem <- subExpMemInfo r
-            let sp' = fromMaybe DefaultSpace sp
-                ixfn' = fmap (adjustExtPE k) ixfn
-                exttp = case r_mem of
-                  MemArray pt shape u ret ->
-                    MemArray pt (fmap Free shape) u $
-                        ReturnsNewBlock sp' 0 ixfn'
-                  _ -> error "impossible in addResCtxInLoopBody"
             return (res_acc ++ [r],
                     ext_acc ++ ext_ses,
-                    ctx_acc ++ mem_ctx_r,
-                    br_acc ++ [exttp],
-                    k + i)
+                    ctx_acc ++ mem_ctx_r)
 
 inspect2 :: MemInfo SubExp u MemBind -> Maybe Space ->  MemInfo (Ext SubExp) u MemReturn
 inspect2 (MemArray pt shape u ret) space =
